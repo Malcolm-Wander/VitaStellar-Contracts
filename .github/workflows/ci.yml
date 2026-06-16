@@ -1,5 +1,5 @@
-# Minimal CI for VitaStellar-Contracts
-# Verifies wasm32 builds, tests pass, and code is formatted
+# CI pipeline for VitaStellar-Contracts
+# Gates: build, test, format, clippy, shellcheck, security-audit, coverage, wasm-size
 
 name: CI
 
@@ -9,7 +9,18 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Stellar contract limits
+  WASM_MAX_SIZE: 65536        # 64 KB hard limit
+  WASM_WARN_PCT: 80           # 80 % warning threshold
+  WASM_CRIT_PCT: 95           # 95 % critical threshold
+
 jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Build – compile every contract for wasm32
+  # ──────────────────────────────────────────────────────────────────────────
   build:
     name: Build (wasm32)
     runs-on: ubuntu-latest
@@ -21,6 +32,17 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
       - name: Build all contracts for wasm32
         run: |
           for contract in contracts/*/; do
@@ -30,6 +52,9 @@ jobs:
             fi
           done
 
+  # ──────────────────────────────────────────────────────────────────────────
+  # Test – workspace-wide unit & integration tests
+  # ──────────────────────────────────────────────────────────────────────────
   test:
     name: Tests
     runs-on: ubuntu-latest
@@ -41,9 +66,23 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
       - name: Run tests
         run: cargo test --workspace
 
+  # ──────────────────────────────────────────────────────────────────────────
+  # Format – enforce rustfmt consistency
+  # ──────────────────────────────────────────────────────────────────────────
   format:
     name: Format Check
     runs-on: ubuntu-latest
@@ -57,3 +96,269 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Clippy – static analysis with project thresholds (clippy.toml)
+  # ──────────────────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      - name: Run clippy (all targets, deny warnings)
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run clippy (wasm32 release)
+        run: |
+          cargo clippy \
+            --workspace \
+            --exclude contract_optimizer \
+            --exclude vitastellar-tests \
+            --exclude interoperability_suite \
+            --target wasm32-unknown-unknown \
+            --release \
+            -- -D warnings
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # ShellCheck – lint all shell scripts using .shellcheckrc
+  # ──────────────────────────────────────────────────────────────────────────
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+
+      - name: Verify ShellCheck version
+        run: shellcheck --version
+
+      - name: Lint shell scripts
+        run: |
+          shopt -s globstar nullglob
+          files=( scripts/**/*.sh scripts/*.sh )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found — skipping."
+            exit 0
+          fi
+          echo "Checking ${#files[@]} script(s)…"
+          shellcheck "${files[@]}"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Security Audit – scan dependencies for known CVEs
+  # ──────────────────────────────────────────────────────────────────────────
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Coverage – test-coverage report via cargo-llvm-cov
+  # ──────────────────────────────────────────────────────────────────────────
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: |
+          cargo llvm-cov --workspace \
+            --exclude contract_optimizer \
+            --lcov \
+            --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+          retention-days: 14
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Coverage summary
+        run: |
+          cargo llvm-cov report --workspace \
+            --exclude contract_optimizer
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # WASM Size Gate – enforce Stellar 64 KB contract-size limit
+  # ──────────────────────────────────────────────────────────────────────────
+  wasm-size:
+    name: WASM Size Gate
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Build optimised WASM
+        run: |
+          cargo build --release --target wasm32-unknown-unknown \
+            --workspace \
+            --exclude contract_optimizer \
+            --exclude vitastellar-tests \
+            --exclude interoperability_suite
+
+      - name: Collect WASM binaries
+        run: |
+          mkdir -p dist
+          for contract in contracts/*/; do
+            name="$(basename "$contract")"
+            wasm="target/wasm32-unknown-unknown/release/${name}.wasm"
+            [ -f "$wasm" ] && cp "$wasm" "dist/${name}.wasm"
+          done
+
+      - name: Check WASM sizes against Stellar limit
+        id: wasm_check
+        run: |
+          MAX=${{ env.WASM_MAX_SIZE }}
+          FAIL_SIZE=51200  # Fail at >51,200 bytes as per acceptance criteria
+          WARN_PCT=${{ env.WASM_WARN_PCT }}
+          WARN_SIZE=$(( MAX * WARN_PCT / 100 ))
+
+          violations=0
+          warnings=0
+
+          printf "%-35s %10s %8s  %s\n" "Contract" "Size (B)" "% of 64KB" "Status"
+          printf "%-35s %10s %8s  %s\n" "-----------------------------------" "----------" "--------" "----------"
+
+          for wasm in dist/*.wasm; do
+            [ -f "$wasm" ] || continue
+            name="$(basename "$wasm" .wasm)"
+            size="$(wc -c < "$wasm")"
+            pct="$(awk "BEGIN {printf \"%.1f\", ($size / $MAX) * 100}")"
+
+            if [ "$size" -gt "$FAIL_SIZE" ]; then
+              status="FAIL"
+              violations=$((violations + 1))
+            elif [ "$size" -gt "$WARN_SIZE" ]; then
+              status="WARNING"
+              warnings=$((warnings + 1))
+            else
+              status="OK"
+            fi
+
+            printf "%-35s %10s %7s%%  %s\n" "$name" "$size" "$pct" "$status"
+          done
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Total contracts : $(ls dist/*.wasm 2>/dev/null | wc -l)"
+          echo "Warnings        : ${warnings}"
+          echo "Violations      : ${violations}"
+
+          if [ "$violations" -gt 0 ]; then
+            echo ""
+            echo "::error::${violations} contract(s) exceed the 51,200 byte limit."
+            exit 1
+          fi
+
+          if [ "$warnings" -gt 0 ]; then
+            echo ""
+            echo "::warning::${warnings} contract(s) are approaching the size limit — consider optimising."
+          fi
+
+      - name: Upload WASM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-binaries
+          path: dist/*.wasm
+          retention-days: 14
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Naming Conventions – enforce naming standards
+  # ──────────────────────────────────────────────────────────────────────────
+  naming:
+    name: Naming Conventions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check naming conventions
+        run: bash scripts/check-naming.sh
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Error Codes – validate error code ranges
+  # ──────────────────────────────────────────────────────────────────────────
+  error-codes:
+    name: Error Codes Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check error codes
+        run: bash scripts/check_error_codes.sh
